@@ -59,6 +59,19 @@
           选中后只扣减该订单与该纸型库存。任一剩余订单在所有可用纸型均无进展时返回受阻订单，不生成空白纸、不误扣库存。
           未填写订单号的行视为同组且不影响其他订单。</p>
       </div>
+      <div id="kitOpts" class="isolate-opts" hidden>
+        <label class="check-line">
+          <input type="checkbox" id="kitMode" />
+          <span><b>成套生产</b>（每张纸只提交完整套，禁止贪心多排形成半套）</span>
+        </label>
+        <label class="kit-sets-line">计划套数（套）
+          <input type="number" id="plannedSets" value="10" min="1" max="100000" step="1" />
+        </label>
+        <p class="hint">勾选后，以每种成品的<b>每套用量</b>（成品表新增列）按比例组成完整套；
+          服务端每张纸都用现有断头台 / 刀缝 / 纹向规则试排，选择<b>完整套数最多</b>的布局：
+          批量模式逐张扣减直到做满计划套数；多纸型模式同套数下再按单位已排面积成本、件数、录入顺序选纸。
+          剩余材料组不成一整套即 <code>no-progress</code>，本轮不扣库存。成套与订单隔离不能同时开启。</p>
+      </div>
       <div id="batchOpts" class="batch-opts" hidden>
         <label>最多用纸张数（张）
           <input type="number" id="maxSheets" value="10" min="1" max="500" step="1" />
@@ -78,9 +91,10 @@
 
       <h2>成品清单</h2>
       <p class="hint products-hint">纹向要求：成品纹向须与纸张纹向平行——「沿自身宽/高」指纸张纹向需平行于成品的宽/高边；不限则两种朝向均可。
-        订单号可选：填写后可在批量/多纸型模式开启「每张纸仅排一个订单」做订单隔离排产。</p>
-      <div class="products-head">
-        <span>名称（可选）</span><span>订单号（可选）</span><span>宽 mm</span><span>高 mm</span><span>数量</span><span>纹向</span><span></span>
+        订单号可选：填写后可在批量/多纸型模式开启「每张纸仅排一个订单」做订单隔离排产。
+        <b id="perSetHint" hidden>成套生产：请为每种成品填写「每套用量」（正整数，该品种每套需要几件），数量列将被忽略，总需求＝每套用量 × 计划套数。</b></p>
+      <div class="products-head" id="productsHead">
+        <span>名称（可选）</span><span>订单号（可选）</span><span>宽 mm</span><span>高 mm</span><span class="qty-head">数量</span><span class="perset-head" hidden>每套用量</span><span>纹向</span><span></span>
       </div>
       <div id="productRows"></div>
       <button type="button" id="addRow" class="btn btn-ghost">＋ 添加成品</button>
@@ -96,6 +110,7 @@
       <h2>排料结果</h2>
       <div id="batchBar" class="batch-bar" hidden></div>
       <div id="costBar" class="batch-bar" hidden></div>
+      <div id="kitProgress" class="kit-progress" hidden></div>
       <div id="orderSummary" class="order-summary" hidden></div>
       <div id="sheetTabs" class="sheet-tabs" hidden></div>
       <div id="sheetMeta" class="sheet-meta" hidden></div>

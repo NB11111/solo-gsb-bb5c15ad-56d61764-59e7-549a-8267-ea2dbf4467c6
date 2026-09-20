@@ -67,6 +67,85 @@ function normalizeIsolateOrders(value) {
   return value;
 }
 
+/* ---------------- 成套生产（kit / set production） ---------------- */
+
+const KIT_MAX_SETS = 100000; // 计划套数上限
+const KIT_MAX_PER_SET = 100000; // 单品种每套用量上限
+// 单次试排展开件数安全阀：仅在极小成品（数毫米级）等极端输入下触及，
+// 正常印刷成品（名片级以上）的整纸张数远低于此值
+const KIT_MAX_TRIAL_PIECES = 50000;
+
+/**
+ * 规范化顶层 kit（成套生产）开关：
+ * 缺省 / false 表示不启用（旧行为）；启用时必须为
+ *   { plannedSets: 正整数（≤100000） }
+ * 成套生产与订单隔离互斥（不允许同时开启）。
+ */
+function normalizeKit(value, { isolateOrders = false } = {}) {
+  if (value == null || value === false) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('kit（成套生产）必须是包含 plannedSets 的对象');
+  }
+  if (isolateOrders) {
+    throw new Error('成套生产模式不能与订单隔离（isolateOrders）同时开启');
+  }
+  const plannedSets = Number(value.plannedSets);
+  if (!Number.isInteger(plannedSets) || plannedSets < 1) {
+    throw new Error('计划套数（plannedSets）必须是正整数');
+  }
+  if (plannedSets > KIT_MAX_SETS) {
+    throw new Error(`计划套数不能超过 ${KIT_MAX_SETS}`);
+  }
+  return { plannedSets };
+}
+
+/**
+ * 规范化成品的“每套用量”：成套模式下每个品种必填正整数。
+ */
+function normalizePerSet(value, pos) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`第 ${pos} 种成品的每套用量必须是正整数`);
+  }
+  if (n > KIT_MAX_PER_SET) {
+    throw new Error(`第 ${pos} 种成品的每套用量不能超过 ${KIT_MAX_PER_SET}`);
+  }
+  return n;
+}
+
+/**
+ * 成套模式下按原始成品行规范化品种清单（批量/成本共用）：
+ * 每行以 perSet（正整数）× plannedSets 作为该品种总需求。
+ * @returns [{ id, name, width, height, grain, orderNo, perSet,
+ *            quantity(=perSet×plannedSets), seq }]
+ */
+function normalizeKitProducts(rawProducts, plannedSets) {
+  if (!Array.isArray(rawProducts)) throw new Error('缺少成品列表');
+  const rows = [];
+  rawProducts.forEach((raw, idx) => {
+    const pos = idx + 1;
+    if (!raw || typeof raw !== 'object') {
+      throw new Error(`第 ${pos} 种成品不是有效记录`);
+    }
+    const w = Number(raw.width);
+    const h = Number(raw.height);
+    if (![w, h].every((n) => Number.isFinite(n)) || w <= 0 || h <= 0) {
+      throw new Error(`第 ${pos} 种成品的宽高必须为正数`);
+    }
+    const perSetVal = normalizePerSet(raw.perSet, pos);
+    const grain = normalizeProductGrain(raw.grain, pos);
+    const orderNo = normalizeOrderNo(raw.orderNo, pos);
+    const id = raw.id != null ? String(raw.id) : `P${pos}`;
+    const name = raw.name && String(raw.name).trim() ? String(raw.name).trim() : '';
+    rows.push({
+      id, name, width: w, height: h, grain, orderNo,
+      perSet: perSetVal, quantity: perSetVal * plannedSets, seq: idx,
+    });
+  });
+  if (rows.length === 0) throw new Error('成套生产至少需要一种成品（填写每套用量）');
+  return rows;
+}
+
 /**
  * 校验并规范化成品清单（排产驱动共用，保证跨张 id/纹向/订单号稳定）。
  * @returns 规范化后的成品行（quantity > 0）：
@@ -315,7 +394,63 @@ function layout(input) {
   let placedCount = 0;
 
   while (remaining.size > 0) {
-    let best = null; // { leaf, piece, rotated, score:[...] }
+    let best = null; // { leaf, piece, rotated, w, h, s0..s3 }
+
+    // BSSF 评分（与原“取余料数组排序”完全等价，但不分配数组）：
+    // 余料总面积 → 最大余料块短边 → 长边 → 是否旋转
+    function consider(leaf, piece, rotated) {
+      const w = rotated ? piece.h : piece.w;
+      const h = rotated ? piece.w : piece.h;
+      const W = leaf.w;
+      const H = leaf.h;
+      // 与 splitPlan 完全一致的可切判定
+      const remW = W - w;
+      const remH = H - h;
+      const canV = remW > EPS && remW >= kerf - EPS;
+      const canH = remH > EPS && remH >= kerf - EPS;
+      // 注意：恰好填满（两侧都不可切）时 splitPlan 为 'none'，
+      // 原算法仍以零余料的满分（0,0,0,...）登记该候选，故不能提前跳过。
+
+      let leftover = 0;
+      let bigArea = -1;
+      let bigMin = 0;
+      let bigMax = 0;
+      const addFree = (fw, fh) => {
+        if (fw > EPS && fh > EPS) {
+          const a = fw * fh;
+          leftover += a;
+          if (a > bigArea) {
+            bigArea = a;
+            bigMin = fw < fh ? fw : fh;
+            bigMax = fw < fh ? fh : fw;
+          }
+        }
+      };
+      if (canV && !canH) {
+        addFree(remW - kerf, H);
+      } else if (!canV && canH) {
+        addFree(W, remH - kerf);
+      } else if (remW < remH) {
+        // vv：右侧整带 + 左下块
+        addFree(remW - kerf, H);
+        addFree(w, remH - kerf);
+      } else {
+        // hh（平局也走这里）：底部整带 + 右上块
+        addFree(W, remH - kerf);
+        addFree(remW - kerf, h);
+      }
+
+      const s3 = rotated ? 1 : 0;
+      if (
+        !best ||
+        (Math.abs(leftover - best.s0) > EPS ? leftover < best.s0
+          : Math.abs(bigMin - best.s1) > EPS ? bigMin < best.s1
+          : Math.abs(bigMax - best.s2) > EPS ? bigMax < best.s2
+          : s3 < best.s3)
+      ) {
+        best = { leaf, piece, rotated, w, h, s0: leftover, s1: bigMin, s2: bigMax, s3 };
+      }
+    }
 
     for (const leaf of freeLeaves) {
       for (const piece of remaining.keys()) {
@@ -324,39 +459,15 @@ function layout(input) {
           grainAllows(piece.grain, paperGrain, false) &&
           piece.w <= leaf.w + EPS && piece.h <= leaf.h + EPS
         ) {
-          consider(leaf, piece, false, kerf);
+          consider(leaf, piece, false);
         }
         // 旋转 90°（成品宽 ∥ 纸张高）：纹向平行才考虑
         if (
           grainAllows(piece.grain, paperGrain, true) &&
           piece.h <= leaf.w + EPS && piece.w <= leaf.h + EPS
         ) {
-          consider(leaf, piece, true, kerf);
+          consider(leaf, piece, true);
         }
-      }
-    }
-
-    function consider(leaf, piece, rotated, kerfW) {
-      const w = rotated ? piece.h : piece.w;
-      const h = rotated ? piece.w : piece.h;
-      // 用与建树完全一致的切分方案取得实际余料矩形
-      const plan = splitPlan(leaf.w, leaf.h, w, h, kerfW);
-      const frees = plan.frees
-        .filter((f) => f.w > EPS && f.h > EPS)
-        .map((f) => ({ ...f, area: f.w * f.h }));
-      frees.sort((a, b) => b.area - a.area);
-
-      const leftoverArea = frees.reduce((s, f) => s + f.area, 0);
-      // BSSF 变体：优先余料总面积小，其次最大余料块的短边短
-      // （余料越窄越难复用，应尽量产生在别处），再比长边，最后偏好不旋转
-      const score = [
-        leftoverArea,
-        frees.length ? Math.min(frees[0].w, frees[0].h) : 0,
-        frees.length ? Math.max(frees[0].w, frees[0].h) : 0,
-        rotated ? 1 : 0,
-      ];
-      if (!best || lexLess(score, best.score)) {
-        best = { leaf, piece, rotated, w, h, score };
       }
     }
 
@@ -369,6 +480,7 @@ function layout(input) {
     piece.placedW = w;
     piece.placedH = h;
 
+    const oldLeaf = leaf;
     const node = occupy(leaf, w, h, kerf, piece);
     if (leaf === root) {
       root = node;
@@ -380,8 +492,12 @@ function layout(input) {
     remaining.delete(piece);
     placedCount += 1;
 
-    freeLeaves = [];
-    collectFreeLeaves(root, freeLeaves);
+    // 增量维护自由叶列表：新子树恰好在旧叶的 DFS 位置展开为其自由叶，
+    // splice 替换后顺序与全树 DFS 收集完全一致（保证平分平局时行为不变）
+    const added = [];
+    collectFreeLeaves(node, added);
+    const idx = freeLeaves.indexOf(oldLeaf);
+    if (idx >= 0) freeLeaves.splice(idx, 1, ...added);
   }
 
   // 统计未排件
@@ -610,6 +726,7 @@ function layoutBatch(input) {
   }
   if (maxSheets > 500) throw new Error('最多用纸张数不能超过 500');
   const isolateOrders = normalizeIsolateOrders(input.isolateOrders);
+  const kit = normalizeKit(input.kit, { isolateOrders });
 
   // 先做一次空纸探路：复用单张纸张/刀缝校验
   const probe = layout({
@@ -620,9 +737,22 @@ function layoutBatch(input) {
     products: [],
   });
   const paperInfo = probe.paper;
-  const products = normalizeProducts(input.products);
-  const totalPieces = products.reduce((s, p) => s + p.quantity, 0);
-  const idTotals = totalsById(products);
+  // 成套模式以每行 perSet（正整数）× plannedSets 作为该品种总需求，
+  // 不使用 quantity，因此跳过要求 quantity 的通用成品规范化。
+  const products = kit ? [] : normalizeProducts(input.products);
+
+  // 成套生产：规范化每种成品的每套用量并展开总需求。
+  // 成套模式下以每行的 perSet（正整数）× plannedSets 作为该品种总需求，
+  // 因此不沿用 quantity（可为空）。
+  let kitSpec = null;
+  if (kit) {
+    const specRows = normalizeKitProducts(input.products, kit.plannedSets);
+    kitSpec = { plannedSets: kit.plannedSets, products: specRows };
+  }
+
+  const driveProducts = kitSpec ? kitSpec.products : products;
+  const totalPieces = driveProducts.reduce((s, p) => s + p.quantity, 0);
+  const idTotals = totalsById(driveProducts);
 
   if (totalPieces === 0) {
     return {
@@ -644,6 +774,9 @@ function layoutBatch(input) {
     };
   }
 
+  if (kitSpec) {
+    return layoutBatchKit(input, paperInfo, maxSheets, kitSpec, totalPieces);
+  }
   if (!isolateOrders) {
     return layoutBatchPlain(input, paperInfo, maxSheets, products, totalPieces, idTotals);
   }
@@ -842,6 +975,247 @@ function layoutBatchIsolated(input, paperInfo, maxSheets, products, totalPieces,
   };
 }
 
+/* ---------------- 成套生产（kit production） ---------------- */
+
+/**
+ * 某品种在 W×H 纸面上“同朝向规整排列”的最大件数（断头台规则的宽松上界）。
+ * 仅用于把富供给试排的展开件数限制在合理范围，不参与候选套数决胜。
+ */
+function gridCapacity(W, H, w, h, kerf) {
+  const f = (a, b) => Math.max(0, Math.floor((a + kerf) / (b + kerf)));
+  const n1 = f(W, w) * f(H, h);
+  const n2 = f(W, h) * f(H, w);
+  return Math.max(n1, n2);
+}
+
+/**
+ * 单张纸成套试排：在一张纸内只允许提交“完整套”布局——
+ * 每个品种恰好 s × perSet 件，绝不留某种件的富余半套。
+ *
+ * 方法（严格保证返回的是“已被试排证实可行”的最大套数）：
+ *  1. 面积上界 sArea = floor(纸面面积 / 每套成品面积) 是完整套数的
+ *     绝对几何上界（忽略刀缝，只会偏大）；
+ *  2. 富供给试排一次（各品种给足，但封顶在该品种纸面面积/网格容量
+ *     之内以免无谓展开数万件），贪心实际产出的完整套数 g 是一个
+ *     保证可行的下界（其中 g 套件确实都在纸上）；
+ *  3. 从 sArea 向下逐档做“精确供给”试排（每品种恰好 s×perSet 件），
+ *     首个全部件都排入者即已证实的最大套数（其布局天然无富余件）；
+ *     因完整套可行性对套数非严格单调（贪心 BSSF 启发式所致），不能
+ *     二分，只能自顶向下；
+ *  4. 高套数档（s>g，供给大、单次较贵）只试有限预算；随后用“精确
+ *     g 套”等小供给（单次便宜）取得一份干净无富余的提交布局；
+ *  若预算内未能在 g 之上证实更大套数，则提交 g 套（保证可交付）。
+ *
+ * 单品种特殊情形：已排件数关于供给单调（fuzz 8 万例 0 反例），
+ * 富供给一次即最优，无需多档扫描。
+ *
+ * @returns { sets:number, layout:object|null, trials:number, truncated:boolean }
+ *   sets=0 表示一张完整套都组不出（layout 为 null）。
+ */
+const KIT_TRIAL_BUDGET = 20; // 单张纸高套数档试排次数上限（启发式预算）
+
+function planKitSheet(paperSpec, kerf, kitProducts, demandQty) {
+  const { paperW, paperH, paperGrain } = paperSpec;
+  const paperArea = paperW * paperH;
+  const perSetArea = kitProducts.reduce((s, p) => s + p.perSet * p.width * p.height, 0);
+  const piecesPerSet = kitProducts.reduce((s, p) => s + p.perSet, 0);
+  const sArea = Math.max(0, Math.floor(paperArea / perSetArea));
+  // 受剩余需求约束的最大套数
+  const sDemand = Math.min(
+    ...kitProducts.map((p, i) => Math.floor(demandQty[i] / p.perSet))
+  );
+  const sMax = Math.min(sArea, sDemand);
+  if (sMax < 1) return { sets: 0, layout: null, trials: 0, truncated: false };
+
+  // 各品种“富供给”数量：给到纸面容量即可（多给的件排不进，只会徒增展开），
+  // 同时不超过剩余需求；并保证不少于 sMax 套所需（sMax 已不超过面积上界）。
+  const richQty = kitProducts.map((p, i) => {
+    const areaCap = Math.floor(paperArea / (p.width * p.height));
+    const gridCap = gridCapacity(paperW, paperH, p.width, p.height, kerf);
+    const cap = Math.max(1, Math.min(areaCap, gridCap + p.perSet));
+    return Math.min(Math.max(cap, sMax * p.perSet), demandQty[i]);
+  });
+
+  const runLayout = (quantities) => layout({
+    paperW, paperH, paperGrain, kerf,
+    products: kitProducts.map((p, i) => ({
+      id: p.id, name: p.name, width: p.width, height: p.height,
+      grain: p.grain, orderNo: p.orderNo, quantity: quantities[i],
+    })),
+  });
+
+  const setsInLayout = (result) => {
+    const counts = new Map();
+    for (const it of result.items) counts.set(it.id, (counts.get(it.id) || 0) + 1);
+    let m = Infinity;
+    kitProducts.forEach((p, i) => {
+      m = Math.min(m, Math.floor((counts.get(p.id) || 0) / p.perSet));
+    });
+    return m;
+  };
+
+  let trials = 0;
+
+  // 单品种：富供给（按几何容量封顶）一次即最优，再做一次精确供给取干净布局
+  if (kitProducts.length === 1) {
+    const p = kitProducts[0];
+    const rich = runLayout([richQty[0]]);
+    trials++;
+    let sets = setsInLayout(rich);
+    sets = Math.min(sets, sMax);
+    while (sets >= 1) {
+      const exact = runLayout([Math.min(sets * p.perSet, demandQty[0])]);
+      trials++;
+      if (exact.stats.piecesPlaced === sets * p.perSet) {
+        return { sets, layout: exact, trials, truncated: false };
+      }
+      sets -= 1; // 极端情况下精确供给未铺满则降档重试
+    }
+    return { sets: 0, layout: null, trials, truncated: false };
+  }
+
+  // 多品种：富供给取得保证可行下界 g
+  const rich = runLayout(richQty);
+  trials++;
+  let g = Math.min(setsInLayout(rich), sMax);
+
+  // 高套数档自顶向下精确试排（预算有限）
+  let truncated = false;
+  for (let s = sMax; s > g; s--) {
+    if (trials >= KIT_TRIAL_BUDGET) { truncated = true; break; }
+    const quantities = kitProducts.map((p, i) => Math.min(s * p.perSet, demandQty[i]));
+    const result = runLayout(quantities);
+    trials++;
+    if (result.stats.piecesPlaced === s * piecesPerSet) {
+      return { sets: s, layout: result, trials, truncated: false };
+    }
+  }
+
+  // 未在 g 之上证实更大套数：提交“精确 g 套”的干净布局（无富余件）。
+  // 若精确 g 因需求已被高段试排影响之外的原因未铺满（理论上富供给里
+  // g 套件确实在纸上），逐档下降直到取得一份完整套布局。
+  for (let s = g; s >= 1; s--) {
+    const quantities = kitProducts.map((p, i) => Math.min(s * p.perSet, demandQty[i]));
+    const result = runLayout(quantities);
+    trials++;
+    if (result.stats.piecesPlaced === s * piecesPerSet) {
+      return { sets: s, layout: result, trials, truncated };
+    }
+    if (trials >= KIT_TRIAL_BUDGET + 8) { truncated = true; break; }
+  }
+  return { sets: 0, layout: null, trials, truncated };
+}
+
+/**
+ * 成套批量排产：每张纸只提交完整套布局，按 planKitSheet 逐张扣减。
+ * 终止原因：completed（套数做满）/ max-sheets / no-progress（剩余材料
+ * 连一整套都组不出；本轮不扣库存/需求，不出空白纸）。
+ */
+function layoutBatchKit(input, paperInfo, maxSheets, kitSpec, totalPieces) {
+  const kerf = Number(input.kerf);
+  const kitProducts = kitSpec.products.map((p, i) => ({ ...p, seqIndex: i }));
+  const demandQty = kitProducts.map((p) => p.quantity); // 剩余件数（按品种）
+  const plannedSets = kitSpec.plannedSets;
+
+  const sheets = [];
+  let placedById = new Map(kitProducts.map((p) => [p.id, 0]));
+  let cutsTotal = 0;
+  let stopReason = 'max-sheets';
+  let setsCompleted = 0;
+  let truncated = false;
+
+  for (let round = 0; round < maxSheets; round++) {
+    const plan = planKitSheet(
+      {
+        paperW: input.paperW,
+        paperH: input.paperH,
+        paperGrain: input.paperGrain,
+      },
+      kerf,
+      kitProducts,
+      demandQty
+    );
+    truncated = truncated || plan.truncated;
+
+    if (plan.sets < 1) {
+      stopReason = setsCompleted >= plannedSets ? 'completed' : 'no-progress';
+      break;
+    }
+
+    const result = plan.layout;
+    // 扣减各品种已排件数（布局只含完整套，无富余件）
+    const counts = new Map();
+    for (const it of result.items) counts.set(it.id, (counts.get(it.id) || 0) + 1);
+    kitProducts.forEach((p) => {
+      const n = counts.get(p.id) || 0;
+      demandQty[p.seqIndex] -= n;
+      placedById.set(p.id, placedById.get(p.id) + n);
+    });
+    setsCompleted += plan.sets;
+    cutsTotal += result.stats.cutsTotal;
+
+    sheets.push(Object.assign(result, { round: round + 1, sets: plan.sets }));
+
+    if (setsCompleted >= plannedSets) {
+      stopReason = 'completed';
+      break;
+    }
+  }
+
+  const placedPieces = [...placedById.values()].reduce((s, n) => s + n, 0);
+
+  return {
+    paper: paperInfo,
+    kit: {
+      mode: 'sets',
+      plannedSets,
+      setsCompleted,
+      setsRemaining: Math.max(0, plannedSets - setsCompleted),
+      perSet: kitProducts.map((p) => ({
+        id: p.id, name: p.name, width: p.width, height: p.height,
+        grain: p.grain, perSet: p.perSet,
+      })),
+    },
+    stopReason,
+    summary: {
+      maxSheets,
+      sheetsUsed: sheets.length,
+      piecesPlaced: placedPieces,
+      piecesTotal: totalPieces,
+      completionRate: round3(setsCompleted / plannedSets),
+      cutsTotal,
+      setsPlanned: plannedSets,
+      setsCompleted,
+      truncated,
+    },
+    sheets,
+    remaining: buildKitRemaining(kitProducts, demandQty, placedById, plannedSets),
+  };
+}
+
+/** 构造成套模式的套内需求 / 已排 / 欠数明细（按品种） */
+function buildKitRemaining(kitProducts, demandQty, placedById, plannedSets) {
+  return kitProducts.map((p) => {
+    const need = p.perSet * plannedSets; // 套内总需求
+    const placed = placedById.get(p.id) || 0;
+    const quantity = Math.max(0, demandQty[p.seqIndex]); // 欠数
+    return {
+      id: p.id,
+      name: p.name,
+      width: p.width,
+      height: p.height,
+      grain: p.grain,
+      orderNo: p.orderNo,
+      perSet: p.perSet, // 每套用量
+      needPerSet: p.perSet,
+      setsPlanned: plannedSets,
+      total: need, // 套内需求
+      placed, // 已排
+      quantity, // 欠数
+    };
+  });
+}
+
 /** 把行的订单号映射回内部组 key（null 行共享 '\0' 组） */
 function groupKeyOf(row) {
   return row.orderNo === null || row.orderNo === undefined ? '\0' : row.orderNo;
@@ -881,5 +1255,9 @@ module.exports = {
   normalizeOrderNo,
   normalizeIsolateOrders,
   normalizeProducts,
+  normalizeKit,
+  normalizePerSet,
+  normalizeKitProducts,
+  planKitSheet,
   buildOrderGroups,
 };

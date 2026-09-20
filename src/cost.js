@@ -31,6 +31,9 @@ const {
   normalizePaperGrain,
   normalizeIsolateOrders,
   normalizeProducts,
+  normalizeKit,
+  normalizeKitProducts,
+  planKitSheet,
   buildOrderGroups,
 } = require('./packer');
 
@@ -121,7 +124,10 @@ function layoutCostBatch(input) {
   }
   const papers = normalizePapers(input.papers);
   const isolateOrders = normalizeIsolateOrders(input.isolateOrders);
-  const products = normalizeProducts(input.products);
+  const kit = normalizeKit(input.kit, { isolateOrders });
+  const products = kit
+    ? normalizeKitProducts(input.products, kit.plannedSets)
+    : normalizeProducts(input.products);
   const totalPieces = products.reduce((s, p) => s + p.quantity, 0);
 
   const usageEmpty = papers.map((p) => ({
@@ -163,7 +169,26 @@ function layoutCostBatch(input) {
       ...(isolateOrders
         ? { isolated: true, orderSummary: [], blockedOrders: [] }
         : {}),
+      ...(kit
+        ? {
+            kit: {
+              mode: 'sets',
+              plannedSets: kit.plannedSets,
+              setsCompleted: 0,
+              setsRemaining: kit.plannedSets,
+              perSet: products.map((p) => ({
+                id: p.id, name: p.name, width: p.width, height: p.height,
+                grain: p.grain, perSet: p.perSet,
+              })),
+            },
+          }
+        : {}),
     };
+  }
+
+  if (kit) {
+    const run = runKit(kerf, papers, products, totalPieces, kit.plannedSets);
+    return assembleResult(kerf, papers, false, run, { kit, products });
   }
 
   const run = isolateOrders
@@ -178,7 +203,7 @@ function layoutCostBatch(input) {
  * @param {object} run
  *   stopReason, sheets, remaining, placedTotal, cutsTotal
  */
-function assembleResult(kerf, papers, isolateOrders, run) {
+function assembleResult(kerf, papers, isolateOrders, run, kitExtra = null) {
   const { stopReason, sheets, remaining, placedTotal, cutsTotal, orderExtras } = run;
 
   const usedCount = new Map(papers.map((p) => [p.id, 0]));
@@ -215,6 +240,21 @@ function assembleResult(kerf, papers, isolateOrders, run) {
   );
   const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
 
+  const kitBlock = kitExtra
+    ? {
+        kit: {
+          mode: 'sets',
+          plannedSets: kitExtra.kit.plannedSets,
+          setsCompleted: run.setsCompleted || 0,
+          setsRemaining: Math.max(0, kitExtra.kit.plannedSets - (run.setsCompleted || 0)),
+          perSet: kitExtra.products.map((p) => ({
+            id: p.id, name: p.name, width: p.width, height: p.height,
+            grain: p.grain, perSet: p.perSet,
+          })),
+        },
+      }
+    : {};
+
   return {
     kerf: round3(kerf),
     papers: papers.map((p) => ({ ...p })),
@@ -233,6 +273,13 @@ function assembleResult(kerf, papers, isolateOrders, run) {
       effectiveCostPerM2: totalPlacedArea > 0
         ? round4((totalCost / totalPlacedArea) * MM2_PER_M2)
         : null,
+      ...(kitExtra
+        ? {
+            setsPlanned: kitExtra.kit.plannedSets,
+            setsCompleted: run.setsCompleted || 0,
+            truncated: !!run.truncated,
+          }
+        : {}),
     },
     sheets,
     usage,
@@ -244,6 +291,7 @@ function assembleResult(kerf, papers, isolateOrders, run) {
           blockedOrders: orderExtras.blockedOrders,
         }
       : {}),
+    ...kitBlock,
   };
 }
 
@@ -621,6 +669,182 @@ function runIsolated(kerf, papers, products, totalPieces) {
     cutsTotal,
     totalPieces,
     orderExtras: { orderSummary, blockedOrders },
+  };
+}
+
+/* ---------------- 成套生产（kit production） ---------------- */
+
+/**
+ * 成套成本排产：每轮对每种有库存纸型调用 planKitSheet 试排“一张完整套纸”，
+ * 选择规则（同套数下沿用普通成本排产决胜）：
+ *   1. 本张完整套数最多；
+ *   2. 单位已排成品面积成本（元/m²）最低；
+ *   3. 本张已排件数多；
+ *   4. 纸型录入顺序靠前。
+ * 只提交完整套布局（无任何品种富余半套）。若所有有库存纸型本轮一套都
+ * 组不出 → no-progress，本轮不扣库存/需求、不出空白纸。
+ */
+function runKit(kerf, papers, kitProducts, totalPieces, plannedSets) {
+  const kitSpecProducts = kitProducts;
+  const stock = new Map(papers.map((p) => [p.id, p.stock]));
+  // 各品种当前剩余件数（按数组下标对应）
+  const demandQty = kitSpecProducts.map((p) => p.quantity);
+
+  // 跨轮缓存：同一纸型在“剩余需求仍足以支撑缓存布局”时复用其成套试排，
+  // 因为成套布局只取决于纸型与品种规格，与还剩多少需求无关（只要够用）。
+  const cache = new Map(); // paperId → { sets, result, requiredQty:[...] }
+
+  const sheets = [];
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let setsCompleted = 0;
+  let truncated = false;
+  let stopReason = null;
+  let grainBlockedById = new Map();
+  const roundLimit = papers.reduce((s, p) => s + p.stock, 0);
+
+  const remainingNow = () => {
+    const out = [];
+    kitSpecProducts.forEach((p, i) => {
+      const need = p.perSet * plannedSets;
+      const quantity = Math.max(0, demandQty[i]);
+      out.push({
+        id: p.id, name: p.name, width: p.width, height: p.height,
+        grain: p.grain, orderNo: p.orderNo,
+        grainBlocked: grainBlockedById.get(p.id) || false,
+        perSet: p.perSet,
+        total: need, placed: need - quantity, quantity,
+      });
+    });
+    return out;
+  };
+
+  for (let round = 0; round < roundLimit; round++) {
+    if (papers.every((p) => stock.get(p.id) <= 0)) {
+      stopReason = 'stock-exhausted';
+      break;
+    }
+
+    const candidates = [];
+    for (const p of papers) {
+      if (stock.get(p.id) <= 0) continue;
+
+      // 复用缓存：缓存布局所需各品种件数仍不超过当前剩余
+      let plan = cache.get(p.id);
+      if (plan) {
+        const reusable = plan.requiredQty.every((q, i) => demandQty[i] >= q);
+        if (!reusable) plan = null;
+      }
+      if (!plan) {
+        const trial = planKitSheet(
+          { paperW: p.width, paperH: p.height, paperGrain: p.grain },
+          kerf, kitSpecProducts, demandQty
+        );
+        truncated = truncated || trial.truncated;
+        if (trial.sets >= 1) {
+          // 该布局各品种实际占用件数
+          const counts = new Map();
+          for (const it of trial.layout.items) {
+            counts.set(it.id, (counts.get(it.id) || 0) + 1);
+          }
+          const requiredQty = kitSpecProducts.map((kp) => counts.get(kp.id) || 0);
+          plan = { sets: trial.sets, result: trial.layout, requiredQty };
+          cache.set(p.id, plan);
+        } else {
+          // 一套都组不出：记录纹向受阻诊断
+          for (const u of trial.layout ? trial.layout.unplaced || [] : []) {
+            if (u.grainBlocked) grainBlockedById.set(u.id, true);
+          }
+        }
+      }
+
+      if (!plan) continue;
+
+      const result = plan.result;
+      const piecesPlaced = result.stats.piecesPlaced;
+      const placedArea = round3(result.stats.placedArea);
+      const rawCostPerM2 = (p.price / placedArea) * MM2_PER_M2;
+      candidates.push({
+        paper: p,
+        result,
+        sets: plan.sets,
+        requiredQty: plan.requiredQty,
+        piecesPlaced,
+        placedArea,
+        rawCostPerM2,
+        costPerM2: placedArea > 0 ? round4(rawCostPerM2) : null,
+      });
+    }
+
+    if (candidates.length === 0) {
+      stopReason = 'no-progress';
+      break;
+    }
+
+    // 完整套数 ↓ → 单位已排面积成本 ↓ → 已排件数 ↓ → 纸型录入顺序 ↑
+    candidates.sort((a, b) => {
+      if (b.sets !== a.sets) return b.sets - a.sets;
+      const da = a.rawCostPerM2 - b.rawCostPerM2;
+      if (Math.abs(da) > 1e-9 * Math.max(1, Math.abs(a.rawCostPerM2), Math.abs(b.rawCostPerM2))) {
+        return da;
+      }
+      if (b.piecesPlaced !== a.piecesPlaced) return b.piecesPlaced - a.piecesPlaced;
+      return a.paper.seq - b.paper.seq;
+    });
+    const best = candidates[0];
+    const p = best.paper;
+
+    // 提交本张：扣库存、按完整套扣减各品种需求
+    stock.set(p.id, stock.get(p.id) - 1);
+    best.requiredQty.forEach((q, i) => { demandQty[i] -= q; });
+    placedTotal += best.piecesPlaced;
+    cutsTotal += best.result.stats.cutsTotal;
+    setsCompleted += best.sets;
+
+    sheets.push({
+      round: round + 1,
+      sets: best.sets,
+      paperId: p.id,
+      paperName: p.name,
+      paperWidth: p.width,
+      paperHeight: p.height,
+      paperGrain: p.grain,
+      price: p.price,
+      piecesPlaced: best.piecesPlaced,
+      placedArea: best.placedArea,
+      costPerM2: best.costPerM2,
+      selection: {
+        ranked: candidates.map((c) => ({
+          paperId: c.paper.id,
+          paperName: c.paper.name,
+          feasible: true,
+          sets: c.sets,
+          piecesPlaced: c.piecesPlaced,
+          placedArea: c.placedArea,
+          costPerM2: c.costPerM2,
+          selected: c === best,
+        })),
+      },
+      layout: best.result,
+    });
+
+    if (setsCompleted >= plannedSets) {
+      stopReason = 'completed';
+      break;
+    }
+  }
+
+  if (stopReason === null) stopReason = 'stock-exhausted';
+
+  return {
+    stopReason,
+    sheets,
+    remaining: remainingNow(),
+    placedTotal,
+    cutsTotal,
+    totalPieces,
+    setsCompleted,
+    truncated,
   };
 }
 

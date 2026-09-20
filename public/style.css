@@ -106,6 +106,68 @@ body {
 .isolate-opts .check-line input { width: auto; }
 .isolate-opts .hint { margin: 6px 0 0; line-height: 1.6; }
 
+.kit-sets-line {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 220px;
+  margin: 8px 0 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 成套生产进度 */
+.kit-progress {
+  border: 1px solid #b2e8c5;
+  background: #f3fbf6;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.kit-progress h3 { margin: 0 0 8px; font-size: 14px; color: #1a6b3c; }
+.kit-progress .kit-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.kit-progress .kit-head b { font-size: 17px; color: #1a6b3c; }
+.kit-progress .kit-bar {
+  height: 12px;
+  background: #e2f2e8;
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 2px 0 10px;
+}
+.kit-progress .kit-bar > span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #2f9e44, #82c91e);
+}
+.kit-progress table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.kit-progress th, .kit-progress td {
+  border: 1px solid #c4e8d1;
+  padding: 5px 8px;
+  text-align: left;
+}
+.kit-progress th { background: #e4f5ea; }
+.kit-progress td.num, .kit-progress th.num { text-align: right; }
+.kit-progress tr.done td { color: #2b8a3e; }
+.kit-progress tr.short td { color: #e67700; }
+.kit-sheet-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 9px;
+  border-radius: 999px;
+  background: #e4f5ea;
+  border: 1px solid #9fe0b6;
+  color: #1a6b3c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .batch-opts {
   border: 1px dashed var(--line);
   border-radius: 8px;
