@@ -106,6 +106,33 @@ body {
 .isolate-opts .check-line input { width: auto; }
 .isolate-opts .hint { margin: 6px 0 0; line-height: 1.6; }
 
+.set-opts {
+  border: 1px solid #b2d8b4;
+  background: #f2fbf3;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.set-opts .check-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.set-opts .check-line input { width: auto; }
+.set-opts .set-count {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 160px;
+  margin-top: 8px;
+}
+.set-opts .hint { margin: 8px 0 0; line-height: 1.6; }
+
 .batch-opts {
   border: 1px dashed var(--line);
   border-radius: 8px;
@@ -221,6 +248,19 @@ body {
   fill: #1c64f2;
   font-weight: 700;
 }
+
+/* 成套进度汇总 */
+.set-summary { margin-bottom: 12px; }
+.set-summary h3 { font-size: 14px; margin: 0 0 8px; color: #102a56; }
+.set-summary table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.set-summary th, .set-summary td {
+  border: 1px solid #bfe3c2;
+  padding: 5px 8px;
+  text-align: left;
+}
+.set-summary th { background: #e6f7e9; }
+.set-summary td.num, .set-summary th.num { text-align: right; }
+.set-summary tr.done td { color: #2b8a3e; }
 
 .cost-usage { margin-bottom: 12px; }
 .cost-usage table { width: 100%; border-collapse: collapse; font-size: 12.5px; }

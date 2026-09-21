@@ -24,6 +24,13 @@
  * 订单录入顺序 ↑、纸型录入顺序 ↑ 决胜；选中后只扣减该订单需求与该纸型库存。
  * 若任一剩余订单在所有可用纸型上均无进展，返回 no-progress 与
  * blockedOrders：本轮不提交任何纸张、不扣任何库存、不生成空白纸。
+ *
+ * 成套生产（input.setMode === true）：填写计划套数 setCount，成品行以
+ * perSet 表示每套用量。每轮对各有库存纸型试排“一张纸内最多完整套数”
+ * （严格按各品种每套用量比例组成整套，不排半套），完整套数最多的纸型
+ * 胜出；同套数再按单位已排面积成本 ↓、件数 ↓、录入顺序 ↑ 决胜。
+ * 选中后扣该纸型库存 1 张与相应套数；若仍有库存的纸型都组不成一整套，
+ * 返回 no-progress 且本轮不扣库存。与订单隔离互斥。
  */
 
 const {
@@ -32,6 +39,10 @@ const {
   normalizeIsolateOrders,
   normalizeProducts,
   buildOrderGroups,
+  normalizeSetMode,
+  normalizeSetCount,
+  normalizeSetProducts,
+  layoutMaxSets,
 } = require('./packer');
 
 const MM2_PER_M2 = 1_000_000;
@@ -111,8 +122,11 @@ function demandFromUnplaced(unplaced) {
  *     grain 为 'along-width' | 'along-height'，缺省沿宽）
  *   products: [{ id?, name?, width, height, quantity, grain?, orderNo? }]
  *   isolateOrders?: boolean（每张纸仅排一个订单，缺省 false）
+ *   setMode?: boolean + setCount + 成品行 perSet（成套生产，与订单隔离互斥）
  * @returns 逐张纸型、布局、选择指标、各纸型用量、总成本、剩余件数与终止原因；
- *   隔离开启时另含 isolated、orderSummary、blockedOrders，逐张含 orderNo
+ *   隔离开启时另含 isolated、orderSummary、blockedOrders，逐张含 orderNo；
+ *   成套开启时另含 setMode、summary.setsPlanned/setsCompleted/setCompletionRate、
+ *   逐张 sets、setSummary（各品种套内需求/已排/欠数）
  */
 function layoutCostBatch(input) {
   const kerf = Number(input.kerf);
@@ -121,6 +135,17 @@ function layoutCostBatch(input) {
   }
   const papers = normalizePapers(input.papers);
   const isolateOrders = normalizeIsolateOrders(input.isolateOrders);
+  const setMode = normalizeSetMode(input.setMode);
+
+  if (setMode) {
+    if (isolateOrders) {
+      throw new Error('成套生产模式不支持订单隔离（isolateOrders）');
+    }
+    const setCount = normalizeSetCount(input.setCount);
+    const setRows = normalizeSetProducts(input.products);
+    return assembleSetResult(kerf, papers, runSets(kerf, papers, setRows, setCount));
+  }
+
   const products = normalizeProducts(input.products);
   const totalPieces = products.reduce((s, p) => s + p.quantity, 0);
 
@@ -412,6 +437,240 @@ function runPlain(kerf, papers, products, totalPieces) {
   });
 
   return { stopReason, sheets, remaining, placedTotal, cutsTotal, totalPieces };
+}
+
+/* ---------------- 成套生产 ---------------- */
+
+/**
+ * 成套成本排产：每轮对各有库存纸型试排“本张最多完整套数”，
+ * 完整套数最多者胜出；同套数按单位已排面积成本 ↓、件数 ↓、
+ * 纸型录入顺序 ↑ 决胜。选中后扣该纸型库存 1 张与相应套数。
+ * 有库存纸型都组不成一整套时 no-progress：本轮不提交、不扣库存。
+ */
+function runSets(kerf, papers, setRows, setCount) {
+  const perSetPieces = setRows.reduce((s, r) => s + r.perSet, 0);
+  const totalPieces = perSetPieces * setCount;
+  const stock = new Map(papers.map((p) => [p.id, p.stock]));
+
+  const sheets = [];
+  let remainingSets = setCount;
+  let placedSets = 0;
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let stopReason = null;
+  let diagResults = []; // 末轮无进展时各有库存纸型的 k=1 诊断性试排
+  // 安全上界：每轮恰提交一张纸扣一张库存，必然终止
+  const roundLimit = papers.reduce((s, p) => s + p.stock, 0);
+
+  // 无有效成品行（每套用量全为 0）：所有套视为已完成，不用纸
+  if (setRows.length === 0) {
+    return {
+      stopReason: 'completed',
+      sheets,
+      setRows,
+      setCount,
+      placedSets: setCount,
+      placedTotal: 0,
+      cutsTotal: 0,
+      totalPieces: 0,
+      diagResults,
+    };
+  }
+
+  for (let round = 0; round < roundLimit && remainingSets > 0; round++) {
+    if (papers.every((p) => stock.get(p.id) <= 0)) {
+      stopReason = 'stock-exhausted';
+      break;
+    }
+
+    const candidates = [];
+    diagResults = [];
+    for (const p of papers) {
+      if (stock.get(p.id) <= 0) continue;
+      const trial = layoutMaxSets(
+        { paperW: p.width, paperH: p.height, paperGrain: p.grain, kerf },
+        setRows,
+        remainingSets
+      );
+      if (trial.sets === 0) {
+        // 组不成一整套的纸型：不参与当轮选择、不扣库存
+        if (trial.result) diagResults.push(trial.result);
+        continue;
+      }
+      const placedArea = round3(trial.result.stats.placedArea);
+      const rawCostPerM2 = (p.price / placedArea) * MM2_PER_M2;
+      candidates.push({
+        paper: p,
+        sets: trial.sets,
+        result: trial.result,
+        piecesPlaced: trial.result.stats.piecesPlaced,
+        placedArea,
+        rawCostPerM2,
+        costPerM2: round4(rawCostPerM2),
+      });
+    }
+
+    if (candidates.length === 0) {
+      // 仍有库存的纸型都组不成一整套：本轮不提交任何纸张、不扣库存
+      stopReason = 'no-progress';
+      break;
+    }
+
+    // 完整套数多者优先；同套数：单位已排面积成本 ↓ → 件数 ↓ → 录入顺序 ↑
+    candidates.sort((a, b) => {
+      if (b.sets !== a.sets) return b.sets - a.sets;
+      const da = a.rawCostPerM2 - b.rawCostPerM2;
+      if (Math.abs(da) > 1e-9 * Math.max(1, Math.abs(a.rawCostPerM2), Math.abs(b.rawCostPerM2))) {
+        return da;
+      }
+      if (b.piecesPlaced !== a.piecesPlaced) return b.piecesPlaced - a.piecesPlaced;
+      return a.paper.seq - b.paper.seq;
+    });
+    const best = candidates[0];
+
+    // 提交本张：扣库存、扣套数
+    stock.set(best.paper.id, stock.get(best.paper.id) - 1);
+    placedSets += best.sets;
+    remainingSets -= best.sets;
+    placedTotal += best.piecesPlaced;
+    cutsTotal += best.result.stats.cutsTotal;
+
+    sheets.push({
+      round: round + 1,
+      paperId: best.paper.id,
+      paperName: best.paper.name,
+      paperWidth: best.paper.width,
+      paperHeight: best.paper.height,
+      paperGrain: best.paper.grain,
+      price: best.paper.price,
+      sets: best.sets,
+      piecesPlaced: best.piecesPlaced,
+      placedArea: best.placedArea,
+      costPerM2: best.costPerM2,
+      selection: {
+        ranked: candidates.map((c) => ({
+          paperId: c.paper.id,
+          paperName: c.paper.name,
+          feasible: true,
+          sets: c.sets,
+          piecesPlaced: c.piecesPlaced,
+          placedArea: c.placedArea,
+          costPerM2: c.costPerM2,
+          selected: c === best,
+        })),
+      },
+      layout: best.result,
+    });
+  }
+
+  if (remainingSets === 0) stopReason = 'completed';
+  if (stopReason === null) stopReason = 'stock-exhausted';
+
+  return {
+    stopReason,
+    sheets,
+    setRows,
+    setCount,
+    placedSets,
+    placedTotal,
+    cutsTotal,
+    totalPieces,
+    diagResults,
+  };
+}
+
+/** 汇总成套成本排产结果（结构同 assembleResult，另含套数进度与各品种套内明细） */
+function assembleSetResult(kerf, papers, run) {
+  const {
+    stopReason, sheets, setRows, setCount,
+    placedSets, placedTotal, cutsTotal, totalPieces, diagResults,
+  } = run;
+
+  const usedCount = new Map(papers.map((p) => [p.id, 0]));
+  const costSum = new Map(papers.map((p) => [p.id, 0]));
+  const placedAreaSum = new Map(papers.map((p) => [p.id, 0]));
+  for (const sh of sheets) {
+    usedCount.set(sh.paperId, usedCount.get(sh.paperId) + 1);
+    costSum.set(sh.paperId, costSum.get(sh.paperId) + sh.price);
+    placedAreaSum.set(sh.paperId, placedAreaSum.get(sh.paperId) + sh.placedArea);
+  }
+  const usage = papers.map((p) => ({
+    id: p.id,
+    name: p.name,
+    width: p.width,
+    height: p.height,
+    grain: p.grain,
+    price: p.price,
+    stock: p.stock,
+    used: usedCount.get(p.id),
+    remainingStock: p.stock - usedCount.get(p.id),
+    cost: round2(costSum.get(p.id)),
+    placedArea: round3(placedAreaSum.get(p.id)),
+  }));
+
+  // 受阻诊断只在无进展终止时有意义：任一纸型 k=1 试排纹向受阻即标记
+  const grainBlockedById = new Map();
+  if (stopReason === 'no-progress') {
+    for (const res of diagResults) {
+      for (const u of res.unplaced) {
+        if (u.grainBlocked) grainBlockedById.set(u.id, true);
+      }
+    }
+  }
+
+  // 每张提交的纸都是完整套：各品种已排 = 每套用量 × 完成套数
+  const setSummary = setRows.map((r) => {
+    const total = r.perSet * setCount;
+    const placed = r.perSet * placedSets;
+    return {
+      id: r.id,
+      name: r.name,
+      width: r.width,
+      height: r.height,
+      grain: r.grain,
+      orderNo: r.orderNo,
+      perSet: r.perSet,
+      total,
+      placed,
+      quantity: total - placed,
+    };
+  });
+  const remaining = setSummary
+    .filter((r) => r.quantity > 0)
+    .map((r) => ({ ...r, grainBlocked: grainBlockedById.get(r.id) || false }));
+
+  const totalCost = round2(sheets.reduce((s, sh) => s + sh.price, 0));
+  const totalPlacedArea = round3(sheets.reduce((s, sh) => s + sh.placedArea, 0));
+  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+
+  return {
+    kerf: round3(kerf),
+    papers: papers.map((p) => ({ ...p })),
+    setMode: true,
+    stopReason,
+    summary: {
+      rounds: sheets.length,
+      sheetsUsed: sheets.length,
+      paperKindsUsed: papers.filter((p) => usedCount.get(p.id) > 0).length,
+      piecesPlaced: placedTotal,
+      piecesTotal: totalPieces,
+      completionRate: round3(completionRate * 1000) / 1000,
+      cutsTotal,
+      totalCost,
+      totalPlacedArea,
+      totalPlacedAreaM2: round4(totalPlacedArea / MM2_PER_M2),
+      effectiveCostPerM2: totalPlacedArea > 0
+        ? round4((totalCost / totalPlacedArea) * MM2_PER_M2)
+        : null,
+      setsPlanned: setCount,
+      setsCompleted: placedSets,
+      setCompletionRate: round3((placedSets / setCount) * 1000) / 1000,
+    },
+    sheets,
+    usage,
+    setSummary,
+    remaining,
+  };
 }
 
 /* ---------------- 订单隔离 ---------------- */

@@ -59,6 +59,20 @@
           选中后只扣减该订单与该纸型库存。任一剩余订单在所有可用纸型均无进展时返回受阻订单，不生成空白纸、不误扣库存。
           未填写订单号的行视为同组且不影响其他订单。</p>
       </div>
+      <div id="setOpts" class="set-opts" hidden>
+        <label class="check-line">
+          <input type="checkbox" id="setMode" />
+          <span><b>成套生产</b>（每张纸只排完整套，不排半套）</span>
+        </label>
+        <label class="set-count">计划套数（套）
+          <input type="number" id="setCount" value="10" min="1" max="500" step="1" />
+        </label>
+        <p class="hint">开启后填写计划套数，成品清单的「数量」列变为<b>每套用量</b>。
+          每轮只提交在一张纸内按各品种每套用量比例组成完整套的布局（按断头台、刀缝、纹向规则试排候选套数，
+          取完整套数最多者），绝不贪心多排某一品种形成无法交付的半套；成本模式同套数下再按单位已排面积成本、
+          件数、录入顺序择优。剩余材料组不成一整套时立即停止（no-progress，本轮不扣库存）。
+          成套生产不支持订单隔离。</p>
+      </div>
       <div id="batchOpts" class="batch-opts" hidden>
         <label>最多用纸张数（张）
           <input type="number" id="maxSheets" value="10" min="1" max="500" step="1" />
@@ -80,7 +94,7 @@
       <p class="hint products-hint">纹向要求：成品纹向须与纸张纹向平行——「沿自身宽/高」指纸张纹向需平行于成品的宽/高边；不限则两种朝向均可。
         订单号可选：填写后可在批量/多纸型模式开启「每张纸仅排一个订单」做订单隔离排产。</p>
       <div class="products-head">
-        <span>名称（可选）</span><span>订单号（可选）</span><span>宽 mm</span><span>高 mm</span><span>数量</span><span>纹向</span><span></span>
+        <span>名称（可选）</span><span>订单号（可选）</span><span>宽 mm</span><span>高 mm</span><span id="qtyHead">数量</span><span>纹向</span><span></span>
       </div>
       <div id="productRows"></div>
       <button type="button" id="addRow" class="btn btn-ghost">＋ 添加成品</button>
@@ -97,6 +111,7 @@
       <div id="batchBar" class="batch-bar" hidden></div>
       <div id="costBar" class="batch-bar" hidden></div>
       <div id="orderSummary" class="order-summary" hidden></div>
+      <div id="setSummary" class="set-summary" hidden></div>
       <div id="sheetTabs" class="sheet-tabs" hidden></div>
       <div id="sheetMeta" class="sheet-meta" hidden></div>
       <div id="costUsage" class="cost-usage" hidden></div>

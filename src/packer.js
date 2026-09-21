@@ -67,6 +67,124 @@ function normalizeIsolateOrders(value) {
   return value;
 }
 
+/* ---------------- 成套生产（set production） ---------------- */
+
+/** 规范化顶层 setMode 开关：必须是布尔值（缺省 false，保持旧行为） */
+function normalizeSetMode(value) {
+  if (value == null) return false;
+  if (typeof value !== 'boolean') {
+    throw new Error('setMode（成套生产）必须是布尔值');
+  }
+  return value;
+}
+
+/** 规范化计划套数：1～500 的整数 */
+function normalizeSetCount(value) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error('计划套数必须是正整数');
+  }
+  if (n > 500) throw new Error('计划套数不能超过 500');
+  return n;
+}
+
+/**
+ * 校验并规范化成套成品清单：每行读取每套用量 perSet（缺失报错），
+ * perSet 为 0 的行不参与成套（与 quantity 为 0 的旧行为一致）。
+ * @returns [{ id, name, width, height, grain, orderNo, perSet, seq }]
+ */
+function normalizeSetProducts(rawProducts) {
+  if (!Array.isArray(rawProducts)) throw new Error('缺少成品列表');
+  const out = [];
+  rawProducts.forEach((p, idx) => {
+    const pos = idx + 1;
+    if (!p || typeof p !== 'object') {
+      throw new Error(`第 ${pos} 种成品不是有效记录`);
+    }
+    const w = Number(p.width);
+    const h = Number(p.height);
+    if (![w, h].every((n) => Number.isFinite(n)) || w <= 0 || h <= 0) {
+      throw new Error(`第 ${pos} 种成品的宽高必须为正数`);
+    }
+    if (p.perSet == null || p.perSet === '') {
+      throw new Error(`第 ${pos} 种成品缺少每套用量（perSet）`);
+    }
+    const perSet = Number(p.perSet);
+    if (!Number.isInteger(perSet) || perSet < 0) {
+      throw new Error(`第 ${pos} 种成品的每套用量必须是非负整数`);
+    }
+    const grain = normalizeProductGrain(p.grain, pos);
+    const orderNo = normalizeOrderNo(p.orderNo, pos);
+    const id = p.id != null ? String(p.id) : `P${pos}`;
+    const name = p.name && String(p.name).trim() ? String(p.name).trim() : '';
+    if (perSet > 0) out.push({ id, name, width: w, height: h, grain, orderNo, perSet, seq: idx });
+  });
+  return out;
+}
+
+/**
+ * 成套试排：在一张纸内排入尽可能多的“完整套”。
+ * 候选套数 k 的需求恒为各品种 perSet × k（严格整套比例），只有 k 套
+ * 一件不剩全部排入才接受该 k——绝不贪心多排某一品种形成无法交付的半套。
+ * 搜索：先试面积上界（纸面宽裕时一次命中），不可行再二分最大可行套数
+ * （同一贪心排样下套数越少越易排下，近似单调）。
+ *
+ * @param paperArgs { paperW, paperH, paperGrain, kerf }（断头台/刀缝/纹向规则同 layout()）
+ * @param setRows  normalizeSetProducts 的输出
+ * @param maxSets  本张最多允许的套数（剩余套数上限，避免超产）
+ * @returns { sets, result }
+ *   sets ≥ 1：result 为 k=sets 的完整布局（可提交）；
+ *   sets = 0：连一整套都组不成，result 为 k=1 的诊断性试排
+ *   （其 unplaced 含尺寸/纹向受阻原因），调用方不得提交该纸。
+ */
+function layoutMaxSets(paperArgs, setRows, maxSets) {
+  if (maxSets < 1) return { sets: 0, result: null };
+  const setArea = setRows.reduce((s, r) => s + r.perSet * r.width * r.height, 0);
+  const paperArea = paperArgs.paperW * paperArgs.paperH;
+
+  const demandFor = (k) => setRows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    width: r.width,
+    height: r.height,
+    grain: r.grain,
+    orderNo: r.orderNo,
+    quantity: r.perSet * k,
+  }));
+  const runK = (k) => layout({ ...paperArgs, products: demandFor(k) });
+  // 整套可行：k 套需求一件不剩全部排入
+  const feasible = (r) => r.stats.piecesPlaced === r.stats.piecesTotal;
+
+  let diagRes = null;
+  let hi = Math.min(maxSets, Math.floor(paperArea / setArea));
+  if (hi >= 1) {
+    const topRes = runK(hi);
+    if (feasible(topRes)) return { sets: hi, result: topRes };
+    if (hi === 1) diagRes = topRes;
+    hi -= 1;
+    // 二分 [1, hi] 内最大可行套数
+    let lo = 1;
+    let bestK = 0;
+    let bestRes = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const res = runK(mid);
+      if (feasible(res)) {
+        bestK = mid;
+        bestRes = res;
+        lo = mid + 1;
+      } else {
+        if (mid === 1) diagRes = res;
+        hi = mid - 1;
+      }
+    }
+    if (bestK > 0) return { sets: bestK, result: bestRes };
+  }
+  // 连一整套都排不下：补一次 k=1 试排（若尚未试过）用于受阻诊断
+  if (!diagRes) diagRes = runK(1);
+  return { sets: 0, result: diagRes };
+}
+
 /**
  * 校验并规范化成品清单（排产驱动共用，保证跨张 id/纹向/订单号稳定）。
  * @returns 规范化后的成品行（quantity > 0）：
@@ -593,8 +711,12 @@ function buildOrderSummary(groups, totals, remainingByKey) {
  * 选中后只扣减该订单需求。若任一剩余订单在当前纸型上无进展，
  * 返回 no-progress 与 blockedOrders，不生成空白纸。
  *
+ * 成套生产（input.setMode === true）：填写计划套数 setCount，成品行以
+ * perSet 表示每套用量；每轮只提交完整套布局（见 layoutBatchSets），
+ * 与订单隔离互斥。
+ *
  * @param {object} input  同 layout()，另需 maxSheets：正整数（≤500），
- *   可选 isolateOrders: boolean
+ *   可选 isolateOrders: boolean，或 setMode: boolean + setCount + 成品行 perSet
  * @returns {{
  *   paper: object, stopReason: string,
  *   summary: { maxSheets, sheetsUsed, piecesPlaced, piecesTotal, completionRate, cutsTotal },
@@ -610,6 +732,7 @@ function layoutBatch(input) {
   }
   if (maxSheets > 500) throw new Error('最多用纸张数不能超过 500');
   const isolateOrders = normalizeIsolateOrders(input.isolateOrders);
+  const setMode = normalizeSetMode(input.setMode);
 
   // 先做一次空纸探路：复用单张纸张/刀缝校验
   const probe = layout({
@@ -620,6 +743,16 @@ function layoutBatch(input) {
     products: [],
   });
   const paperInfo = probe.paper;
+
+  if (setMode) {
+    if (isolateOrders) {
+      throw new Error('成套生产模式不支持订单隔离（isolateOrders）');
+    }
+    const setCount = normalizeSetCount(input.setCount);
+    const setRows = normalizeSetProducts(input.products);
+    return layoutBatchSets(input, paperInfo, maxSheets, setRows, setCount);
+  }
+
   const products = normalizeProducts(input.products);
   const totalPieces = products.reduce((s, p) => s + p.quantity, 0);
   const idTotals = totalsById(products);
@@ -652,9 +785,145 @@ function layoutBatch(input) {
   );
 }
 
+/**
+ * 成套批量排产：每轮只提交“在一张纸内按各品种每套用量比例组成完整套”
+ * 的布局（layoutMaxSets 试排候选套数，取完整套数最多者），禁止贪心多排
+ * 某一品种形成无法交付的半套。每张纸排完扣减完成套数，直到：
+ *  - 完成全部计划套数       → stopReason: 'completed'
+ *  - 已用纸张达到 maxSheets → stopReason: 'max-sheets'
+ *  - 剩余纸面组不成一整套   → stopReason: 'no-progress'
+ *    （本轮不提交纸张，绝不输出空白纸）
+ *
+ * @returns 同 layoutBatchPlain，另含 setMode、summary.setsPlanned/
+ *   setsCompleted/setCompletionRate、逐张 sets、setSummary（各品种
+ *   套内需求 perSet、已排 placed、欠数 quantity）
+ */
+function layoutBatchSets(input, paperInfo, maxSheets, setRows, setCount) {
+  const perSetPieces = setRows.reduce((s, r) => s + r.perSet, 0);
+  const totalPieces = perSetPieces * setCount;
+
+  // 无有效成品行（每套用量全为 0）：所有套视为已完成，不用纸
+  if (setRows.length === 0) {
+    return {
+      paper: paperInfo,
+      setMode: true,
+      stopReason: 'completed',
+      summary: {
+        maxSheets,
+        sheetsUsed: 0,
+        piecesPlaced: 0,
+        piecesTotal: 0,
+        completionRate: 1,
+        cutsTotal: 0,
+        setsPlanned: setCount,
+        setsCompleted: setCount,
+        setCompletionRate: 1,
+      },
+      sheets: [],
+      setSummary: [],
+      remaining: [],
+    };
+  }
+
+  const paperArgs = {
+    paperW: input.paperW,
+    paperH: input.paperH,
+    paperGrain: input.paperGrain,
+    kerf: input.kerf,
+  };
+
+  const sheets = [];
+  let paper = paperInfo;
+  let remainingSets = setCount;
+  let placedSets = 0;
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let stopReason = 'max-sheets';
+  let diagUnplaced = null;
+
+  // 每张至少完成一套，循环上界 maxSheets，必然终止
+  for (let n = 0; n < maxSheets && remainingSets > 0; n++) {
+    const trial = layoutMaxSets(paperArgs, setRows, remainingSets);
+    if (trial.sets === 0) {
+      // 剩余纸面组不成完整一套：本轮不提交纸张，立即止损
+      stopReason = 'no-progress';
+      diagUnplaced = trial.result ? trial.result.unplaced : null;
+      break;
+    }
+    paper = trial.result.paper;
+    sheets.push(Object.assign(trial.result, { sets: trial.sets }));
+    placedSets += trial.sets;
+    remainingSets -= trial.sets;
+    placedTotal += trial.result.stats.piecesPlaced;
+    cutsTotal += trial.result.stats.cutsTotal;
+  }
+  if (remainingSets === 0) stopReason = 'completed';
+
+  const grainBlockedById = new Map();
+  if (stopReason === 'no-progress' && diagUnplaced) {
+    for (const u of diagUnplaced) {
+      if (u.grainBlocked) grainBlockedById.set(u.id, true);
+    }
+  }
+
+  // 每张提交的纸都是完整套：各品种已排 = 每套用量 × 完成套数
+  const setSummary = setRows.map((r) => {
+    const total = r.perSet * setCount;
+    const placed = r.perSet * placedSets;
+    return {
+      id: r.id,
+      name: r.name,
+      width: r.width,
+      height: r.height,
+      grain: r.grain,
+      orderNo: r.orderNo,
+      perSet: r.perSet,
+      total,
+      placed,
+      quantity: total - placed,
+    };
+  });
+  const remaining = setSummary
+    .filter((r) => r.quantity > 0)
+    .map((r) => ({
+      id: r.id,
+      name: r.name,
+      width: r.width,
+      height: r.height,
+      grain: r.grain,
+      orderNo: r.orderNo,
+      perSet: r.perSet,
+      grainBlocked: grainBlockedById.get(r.id) || false,
+      total: r.total,
+      placed: r.placed,
+      quantity: r.quantity,
+    }));
+
+  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+
+  return {
+    paper,
+    setMode: true,
+    stopReason,
+    summary: {
+      maxSheets,
+      sheetsUsed: sheets.length,
+      piecesPlaced: placedTotal,
+      piecesTotal: totalPieces,
+      completionRate: round3(completionRate * 1000) / 1000, // 0..1
+      cutsTotal,
+      setsPlanned: setCount,
+      setsCompleted: placedSets,
+      setCompletionRate: round3((placedSets / setCount) * 1000) / 1000, // 0..1
+    },
+    sheets,
+    setSummary,
+    remaining,
+  };
+}
+
 /** 非隔离批量排产：原有逐张混排行为 */
-function layoutBatchPlain(input, paperInfo, maxSheets, products, totalPieces, idTotals) {
-  let demand = products;
+function layoutBatchPlain(input, paperInfo, maxSheets, products, totalPieces, idTotals) {  let demand = products;
   const sheets = [];
   let paper = paperInfo;
   let lastUnplaced = [];
@@ -882,4 +1151,8 @@ module.exports = {
   normalizeIsolateOrders,
   normalizeProducts,
   buildOrderGroups,
+  normalizeSetMode,
+  normalizeSetCount,
+  normalizeSetProducts,
+  layoutMaxSets,
 };
